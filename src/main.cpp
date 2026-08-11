@@ -243,9 +243,10 @@ extern "C" void app_main(void)
                 if (telegram_poll_message(msg, sizeof(msg))) {
                     if (strcmp(msg, "/status") == 0) {
                         ESP_LOGW(TAG, "Status called");
-                        telegram_send_messagef("🔋 Battery=%.0f%% AC in=%.0fW AC out=%.0fW DC in=%.0fW DC out=%.0fW V in=%.1fV",
+                        telegram_send_messagef("🔋 Battery=%.0f%% AC in=%.0fW AC out=%.0fW DC in=%.0fW DC out=%.0fW V in=%.1fV Device=%s",
                             data.battery_soc, data.ac_input_power, data.ac_output_power,
-                            data.dc_input_power, data.dc_output_power, data.ac_input_voltage);
+                            data.dc_input_power, data.dc_output_power, data.ac_input_voltage,
+                            data.device_type);
                     }
                     if (strcmp(msg, "/restart") == 0) {
                         ESP_LOGW(TAG, "restart called");
@@ -266,6 +267,24 @@ extern "C" void app_main(void)
                         ESP_LOGW(TAG, "debug called");
                         sendDebugTgMsg = !sendDebugTgMsg;
                         telegram_send_messagef("🐛 Debug messages %s", sendDebugTgMsg ? "enabled" : "disabled");
+                    }
+                    if (strcasecmp(msg, "/switchAC") == 0) {
+                        ESP_LOGW(TAG, "switchAC called");
+                        bool new_state = false;
+                        if (toggle_ac_output(&new_state)) {
+                            telegram_send_messagef("✅ AC output switched %s", new_state ? "ON" : "OFF");
+                        } else {
+                            telegram_send_message("❌ Failed to switch AC output - see device log");
+                        }
+                    }
+                    if (strcasecmp(msg, "/switchDC") == 0) {
+                        ESP_LOGW(TAG, "switchDC called");
+                        bool new_state = false;
+                        if (toggle_dc_output(&new_state)) {
+                            telegram_send_messagef("✅ DC output switched %s", new_state ? "ON" : "OFF");
+                        } else {
+                            telegram_send_message("❌ Failed to switch DC output - see device log");
+                        }
                     }
                 }
 

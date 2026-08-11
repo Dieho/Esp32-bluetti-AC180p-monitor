@@ -108,10 +108,15 @@ enum HandshakeMsgType {
 #define REG_DC_INPUT_POWER    144   // Watts
 #define REG_AC_INPUT_POWER    146   // Watts
 #define REG_AC_INPUT_VOLTAGE  1314  // raw value is Volts*10
+#define REG_DEVICE_TYPE       110   // 6 words (12 bytes) - an ASCII string, not a number; see read_device_type()
+#define REG_DEVICE_TYPE_WORDS 6
+#define REG_CTRL_AC            2011  // AC output switch: 0 = off, 1 = on (readable + writable)
+#define REG_CTRL_DC            2012  // DC output switch: 0 = off, 1 = on (readable + writable)
 
-// Modbus function code for "read holding registers" - the only one this
-// read-only project needs.
-#define MODBUS_READ_FUNCTION 3
+// Modbus function codes this file uses: "read holding registers", and
+// "write single register" (for the AC/DC output switches).
+#define MODBUS_READ_FUNCTION  3
+#define MODBUS_WRITE_FUNCTION 6
 
 // =============================================================================
 // SECTION 2: Small self-contained helpers (CRC16, MD5)
@@ -1637,6 +1642,74 @@ static bool read_register(uint16_t address, uint16_t quantity,
     return true;
 }
 
+// Builds an 8-byte "write single register" command:
+// [address=1][function=6][reg_hi][reg_lo][value_hi][value_lo][crc_lo][crc_hi]
+static void build_write_command(uint16_t address, uint16_t value, uint8_t out[8])
+{
+    out[0] = 0x01;
+    out[1] = MODBUS_WRITE_FUNCTION;
+    out[2] = (uint8_t)(address >> 8);
+    out[3] = (uint8_t)(address & 0xFF);
+    out[4] = (uint8_t)(value >> 8);
+    out[5] = (uint8_t)(value & 0xFF);
+    uint16_t crc = modbus_crc16(out, 6);
+    out[6] = (uint8_t)(crc & 0xFF);        // CRC is sent low-byte first
+    out[7] = (uint8_t)((crc >> 8) & 0xFF);
+}
+
+// Sends one "write single register" command and waits for the station to
+// echo it back - the standard Modbus confirmation for function code 6 is a
+// byte-for-byte copy of the request. Returns true only if that exact echo
+// arrives (which also implicitly confirms the CRC and function code, since
+// any of those being wrong would make the echo not match what we sent).
+//
+// CAVEAT: unlike read_register() above, this has no working reference to
+// verify against - bluetti-bt-lib's device_writer.py explicitly refuses to
+// write anything when encryption is enabled ("Encryption on writes is not
+// yet supported"). This implementation is a reasoned extrapolation - writes
+// use the exact same Modbus framing + AES-CBC transport that reads already
+// use successfully - not a verified port. Treat the first real write as a
+// first test, not a known-working feature.
+static bool write_register(uint16_t address, uint16_t value)
+{
+    uint8_t cmd[8];
+    build_write_command(address, value, cmd);
+
+    bluettiState.response_ok = false;
+    xSemaphoreTake(bluettiState.sem_response, 0); // drain any stale signal
+
+    bool sent;
+    if (bluettiState.use_encryption) {
+        uint8_t encrypted[64];
+        size_t encrypted_len = 0;
+        if (!aes_cbc_encrypt(cmd, sizeof(cmd), bluettiState.secure_aes_key, sizeof(bluettiState.secure_aes_key), nullptr,
+                             encrypted, sizeof(encrypted), &encrypted_len)) {
+            return false;
+        }
+        sent = send_raw(encrypted, encrypted_len);
+    } else {
+        sent = send_raw(cmd, sizeof(cmd));
+    }
+    if (!sent) return false;
+
+    if (xSemaphoreTake(bluettiState.sem_response, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "write_register(0x%04x): timed out waiting for response", address);
+        return false;
+    }
+    if (!bluettiState.response_ok) return false;
+
+    const uint8_t *resp = bluettiState.response_buf;
+    size_t resp_len = bluettiState.response_len;
+
+    if (resp_len != sizeof(cmd) || memcmp(resp, cmd, sizeof(cmd)) != 0) {
+        ESP_LOGW(TAG, "write_register(0x%04x): response did not echo the request "
+                       "(len=%u) - station may have rejected the write or this isn't "
+                       "how it wants encrypted writes framed", address, (unsigned)resp_len);
+        return false;
+    }
+    return true;
+}
+
 // Reads a single 16-bit register and returns it as a plain integer.
 static bool read_u16(uint16_t address, uint16_t *out_value)
 {
@@ -1646,6 +1719,38 @@ static bool read_u16(uint16_t address, uint16_t *out_value)
         return false;
     }
     *out_value = ((uint16_t)data[0] << 8) | data[1];
+    return true;
+}
+
+// Reads the device type/model string (e.g. "AC180P") from REG_DEVICE_TYPE.
+// Unlike every other register in this file, this one isn't a number - it's
+// a raw ASCII string packed into REG_DEVICE_TYPE_WORDS 16-bit words, with
+// each adjacent byte pair swapped on the wire (the station's own encoding
+// quirk for this field, confirmed against bluetti-bt-lib's SwapStringField -
+// not something we get to choose). Shorter model names are right-padded
+// with zero bytes, so the result is stopped at the first null.
+static bool read_device_type(char *out, size_t out_cap)
+{
+    uint8_t raw[REG_DEVICE_TYPE_WORDS * 2];
+    size_t len = 0;
+    if (!read_register(REG_DEVICE_TYPE, REG_DEVICE_TYPE_WORDS, raw, sizeof(raw), &len)) {
+        return false;
+    }
+
+    // Swap every adjacent byte pair (raw[0]<->raw[1], raw[2]<->raw[3], ...)
+    // to undo the station's on-the-wire byte order for this field.
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        uint8_t tmp = raw[i];
+        raw[i] = raw[i + 1];
+        raw[i + 1] = tmp;
+    }
+
+    size_t copy_len = (len < out_cap) ? len : out_cap - 1;
+    size_t out_i = 0;
+    for (; out_i < copy_len && raw[out_i] != '\0'; out_i++) {
+        out[out_i] = (char)raw[out_i];
+    }
+    out[out_i] = '\0';
     return true;
 }
 
@@ -1792,10 +1897,58 @@ bool get_all_data(bluetti_data_t *out_data)
         all_ok = false;
     }
 
+    if (!read_device_type(out_data->device_type, sizeof(out_data->device_type))) {
+        all_ok = false;
+    }
+
     xSemaphoreGive(bluettiState.mutex);
 
     out_data->valid = all_ok;
     return all_ok;
+}
+
+// Reads the current state of a switch-type register (0/1, e.g. REG_CTRL_AC/
+// REG_CTRL_DC), flips it, and writes the new value back. Reads fresh state
+// every time rather than trusting a remembered value, so this can't drift
+// out of sync with reality if the station's actual state ever changed some
+// other way (its own physical button, a previous write we thought failed
+// but didn't, etc). On success, `*out_new_state` is the value it was
+// switched TO.
+static bool toggle_switch_register(uint16_t address, bool *out_new_state)
+{
+    if (bluettiState.conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGE(TAG, "toggle_switch_register(0x%04x): not connected", address);
+        return false;
+    }
+    if (bluettiState.use_encryption && bluettiState.stage != HS_READY) {
+        ESP_LOGE(TAG, "toggle_switch_register(0x%04x): encryption handshake not complete yet", address);
+        return false;
+    }
+
+    xSemaphoreTake(bluettiState.mutex, portMAX_DELAY);
+
+    uint16_t current = 0;
+    bool ok = read_u16(address, &current);
+    if (ok) {
+        uint16_t next = current ? 0 : 1;
+        ok = write_register(address, next);
+        if (ok) {
+            *out_new_state = (next != 0);
+        }
+    }
+
+    xSemaphoreGive(bluettiState.mutex);
+    return ok;
+}
+
+bool toggle_ac_output(bool *out_new_state)
+{
+    return toggle_switch_register(REG_CTRL_AC, out_new_state);
+}
+
+bool toggle_dc_output(bool *out_new_state)
+{
+    return toggle_switch_register(REG_CTRL_DC, out_new_state);
 }
 
 void stop_connection(void)

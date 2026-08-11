@@ -46,6 +46,11 @@ typedef struct {
     float dc_input_power;    // Power coming IN from solar/DC (W)
     float dc_output_power;   // Power going OUT to USB/DC devices (W)
     float ac_input_voltage;  // AC input line voltage (V)
+    // Device type string (e.g. "AC180P"). The register this comes from is
+    // 6 x 16-bit words (12 raw bytes) wide, so this needs to fit up to 12
+    // characters + a null terminator - a shorter model name is just
+    // null-padded within that space, not a smaller field.
+    char device_type[13];
 } bluetti_data_t;
 
 // Connects to the station and performs the handshake needed before it will
@@ -84,6 +89,20 @@ bool get_all_data(bluetti_data_t *out_data);
 // called again (same or different station). Safe to call even if not
 // currently connected.
 void stop_connection(void);
+
+// Toggles the station's AC/DC output switch: reads the current on/off
+// state, flips it, and writes the new value back. Blocks until done (a
+// read + a write round-trip over BLE). On success, `*out_new_state` is set
+// to whichever state it was switched TO (true = on). Returns false on any
+// read/write/timeout failure, in which case the switch was NOT changed (or
+// its new state is unknown - check by reading again).
+//
+// CAVEAT: writing to the station is new and, unlike every read in this
+// file, has no confirmed-working reference to have been ported from - see
+// the comment on write_register() in bluetti_ble.cpp for why. Treat this
+// as experimental until you've verified it against your real station.
+bool toggle_ac_output(bool *out_new_state);
+bool toggle_dc_output(bool *out_new_state);
 
 #ifdef __cplusplus
 }
