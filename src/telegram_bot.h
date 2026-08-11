@@ -82,6 +82,19 @@ bool telegram_send_messagef(const char *fmt, ...);
 // against "/status" or any other command is up to your own code.
 bool telegram_poll_message(char *out_text, size_t out_cap);
 
+// Sends a photo to the configured chat, given as a URL rather than
+// uploaded file data - Telegram's own servers fetch `photo_url` and post
+// it as an inline image, so this stays cheap regardless of how large the
+// actual image is (nothing but the URL string itself passes through this
+// ESP32). `caption` may be NULL/empty for no caption. Same blocking/
+// return-value behaviour as telegram_send_message().
+//
+// This is the shape you want for e.g. a QuickChart.io chart URL (see
+// chart.cpp) - QuickChart renders the image on QuickChart's own servers,
+// and Telegram fetches it directly from there, so this device never
+// handles image bytes at all, just a (possibly long, a few KB) URL string.
+bool telegram_send_photo_url(const char *photo_url, const char *caption);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,6 +43,7 @@ static const char *TAG = "telegram_bot";
 enum class TelegramJob {
     SEND_MESSAGE,
     POLL_MESSAGE,
+    SEND_PHOTO,
 };
 
 // All mutable state for this module - see BluettiState in bluetti_ble.cpp
@@ -69,6 +70,8 @@ struct TelegramState {
     const char *job_text;      // SEND_MESSAGE input: text to send
     char *job_out_text;        // POLL_MESSAGE output: where to write the result
     size_t job_out_cap;
+    const char *job_photo_url; // SEND_PHOTO input: image URL (Telegram fetches it, we don't)
+    const char *job_caption;   // SEND_PHOTO input: optional caption, may be NULL
     bool job_result;
 
     // Filled in by http_event_handler() while a request is in flight, so
@@ -76,8 +79,10 @@ struct TelegramState {
     // (esp_http_client doesn't buffer the response for you - you either
     // stream it via a callback, which is what this does, or read it
     // manually after esp_http_client_perform(); the callback is simpler
-    // here since responses are always small).
-    char response_buf[512];
+    // here since responses are always small). Sized for sendPhoto's
+    // response too, which echoes back several generated thumbnail sizes
+    // and is noticeably chunkier than a plain sendMessage response.
+    char response_buf[1024];
     size_t response_len = 0;
 
     // Telegram's getUpdates "offset" parameter: telling the server
@@ -290,6 +295,101 @@ bool telegram_send_messagef(const char *fmt, ...)
     return telegram_send_message(text);
 }
 
+// Actual implementation of telegram_send_photo_url() - runs on
+// telegram_worker_task(). The photo URL (e.g. a QuickChart.io chart URL
+// carrying the whole chart config) can be several KB long - deliberately
+// heap-allocated (malloc/free) rather than stack-allocated here, since
+// this runs on the worker task's stack, which is sized for a TLS
+// handshake's needs, not for holding multi-KB local buffers on top of that.
+static bool telegram_send_photo_url_impl(const char *photo_url, const char *caption)
+{
+    char url[160];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", g.bot_token);
+
+    size_t url_len = strlen(photo_url);
+    size_t caption_len = caption ? strlen(caption) : 0;
+
+    // json_escape_into() can expand a string to at most 2x its input
+    // length (every character becoming a 2-character \X escape) + 1 for
+    // the null terminator - see that function's own comment.
+    size_t escaped_url_cap = url_len * 2 + 1;
+    size_t escaped_caption_cap = caption_len * 2 + 1;
+    char *escaped_url = (char *)malloc(escaped_url_cap);
+    char *escaped_caption = (char *)malloc(escaped_caption_cap);
+    if (!escaped_url || !escaped_caption) {
+        ESP_LOGE(TAG, "telegram_send_photo_url: out of memory");
+        free(escaped_url);
+        free(escaped_caption);
+        return false;
+    }
+    json_escape_into(photo_url, escaped_url, escaped_url_cap);
+    if (caption) {
+        json_escape_into(caption, escaped_caption, escaped_caption_cap);
+    } else {
+        escaped_caption[0] = '\0';
+    }
+
+    // Body: {"chat_id":"<chat_id>","photo":"<escaped url>","caption":"<escaped caption>"}
+    size_t body_cap = escaped_url_cap + escaped_caption_cap + 128; // +128: JSON envelope + chat_id
+    char *body = (char *)malloc(body_cap);
+    if (!body) {
+        ESP_LOGE(TAG, "telegram_send_photo_url: out of memory");
+        free(escaped_url);
+        free(escaped_caption);
+        return false;
+    }
+    int written = snprintf(body, body_cap, "{\"chat_id\":\"%s\",\"photo\":\"%s\",\"caption\":\"%s\"}",
+                           g.chat_id, escaped_url, escaped_caption);
+
+    free(escaped_url);
+    free(escaped_caption);
+
+    if (written < 0 || (size_t)written >= body_cap) {
+        ESP_LOGE(TAG, "telegram_send_photo_url: photo URL too long, not sent");
+        free(body);
+        return false;
+    }
+
+    g.response_len = 0;
+    g.response_buf[0] = '\0';
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.event_handler = http_event_handler;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    // Longer than sendMessage's 10s: Telegram has to fetch and render the
+    // image from the photo URL itself before it can reply, not just accept
+    // some text.
+    config.timeout_ms = 15000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "telegram_send_photo_url: esp_http_client_init failed");
+        free(body);
+        return false;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, written);
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        ok = (status == 200) && (strstr(g.response_buf, "\"ok\":true") != nullptr);
+        if (!ok) {
+            ESP_LOGE(TAG, "telegram_send_photo_url: failed (HTTP %d): %s", status, g.response_buf);
+        }
+    } else {
+        ESP_LOGE(TAG, "telegram_send_photo_url: HTTP request failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    free(body);
+    return ok;
+}
+
 // Actual implementation of telegram_poll_message() - runs on
 // telegram_worker_task(). Same "no locking in here, caller already holds
 // g.mutex for the whole job" reasoning as telegram_send_message_impl().
@@ -377,6 +477,8 @@ static void telegram_worker_task(void *param)
         xSemaphoreTake(g.worker_start, portMAX_DELAY);
         if (g.job_type == TelegramJob::SEND_MESSAGE) {
             g.job_result = telegram_send_message_impl(g.job_text);
+        } else if (g.job_type == TelegramJob::SEND_PHOTO) {
+            g.job_result = telegram_send_photo_url_impl(g.job_photo_url, g.job_caption);
         } else {
             g.job_result = telegram_poll_message_impl(g.job_out_text, g.job_out_cap);
         }
@@ -394,6 +496,24 @@ bool telegram_send_message(const char *text)
     xSemaphoreTake(g.mutex, portMAX_DELAY);
     g.job_type = TelegramJob::SEND_MESSAGE;
     g.job_text = text;
+    xSemaphoreGive(g.worker_start);
+    xSemaphoreTake(g.worker_done, portMAX_DELAY);
+    bool result = g.job_result;
+    xSemaphoreGive(g.mutex);
+    return result;
+}
+
+bool telegram_send_photo_url(const char *photo_url, const char *caption)
+{
+    if (!g.initialized) {
+        ESP_LOGE(TAG, "telegram_send_photo_url: telegram_bot_init() was never called");
+        return false;
+    }
+
+    xSemaphoreTake(g.mutex, portMAX_DELAY);
+    g.job_type = TelegramJob::SEND_PHOTO;
+    g.job_photo_url = photo_url;
+    g.job_caption = caption;
     xSemaphoreGive(g.worker_start);
     xSemaphoreTake(g.worker_done, portMAX_DELAY);
     bool result = g.job_result;

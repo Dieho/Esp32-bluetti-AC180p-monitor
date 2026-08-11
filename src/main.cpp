@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -13,6 +14,10 @@
 #include "telegram_bot.h"
 #include "esp_system.h"
 #include "main.h"
+#include "data_logger.h"
+#include "chart.h"
+#include "esp_netif_sntp.h"
+#include <time.h>
 
 // WiFi/Bluetti/Telegram credentials live in secrets.h, which is gitignored -
 // see secrets.example.h for the template to copy if this file doesn't exist
@@ -99,6 +104,41 @@ static void wifi_init_station(void)
         ESP_LOGE(TAG, "Failed to connect to WiFi");
     }
 }
+
+// Syncs the system clock over NTP so data_logger.cpp's records get real,
+// comparable UTC timestamps across reboots - without this, each boot's
+// "current time" starts back near 0 (Jan 1 1970), which is exactly the
+// "can't compare timestamps across a reboot" problem noted in
+// data_logger.h. Needs WiFi already connected - call after
+// wifi_init_station().
+//
+// Blocks up to ~15s waiting for the first sync (SNTP itself randomizes its
+// very first request by up to 5s, to avoid every device on a network
+// hammering the server at the same instant - see
+// CONFIG_LWIP_SNTP_MAXIMUM_STARTUP_DELAY - so this needs more headroom than
+// the round-trip alone). If it times out (no internet, NTP blocked by a
+// firewall, etc), this logs a warning and moves on rather than blocking
+// startup forever - esp_netif_sntp keeps retrying in the background
+// regardless, so logged records just carry an obviously-wrong low
+// timestamp until sync eventually succeeds.
+static void time_sync_init(void)
+{
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&config);
+
+    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000)) != ESP_OK) {
+        ESP_LOGW(TAG, "time_sync_init: NTP sync timed out - logged timestamps will be "
+                       "wrong until it succeeds in the background");
+        return;
+    }
+
+    time_t now = time(NULL);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
+    ESP_LOGI(TAG, "Time synced via NTP: %s", time_str);
+}
 #define BUTTON_PIN GPIO_NUM_0
 
 extern "C" void app_main(void)
@@ -133,7 +173,9 @@ extern "C" void app_main(void)
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
     wifi_init_station();
+    time_sync_init();
     telegram_bot_init(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID);
+    data_logger_init();
 
     gpio_reset_pin(BUTTON_PIN);
     gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
@@ -141,7 +183,14 @@ extern "C" void app_main(void)
 
     int64_t last_check_time = 0;
     int64_t last_press_time = 0;
+    int64_t last_log_time = 0;
     const int64_t check_interval_us = 10000 * 1000;   // 10s interval for checking Bluetti data
+    // Logging interval is deliberately much coarser than the 10s live poll
+    // above - a history graph doesn't need 10-second resolution, and
+    // logging less often means the ~8MB log partition covers a much longer
+    // span before it's full (roughly a year at this interval - see the
+    // retention math in data_logger.h/the earlier storage investigation).
+    const int64_t log_interval_us = 60 * 1000 * 1000; // 1 minute
     const int64_t debounce_us = 200 * 1000;         // 200ms debounce
     bool button_was_pressed = false;
     float last_notified_battery_soc = -1.0f; // -1 = "never notified yet"
@@ -165,6 +214,14 @@ extern "C" void app_main(void)
                     // ESP_LOGI(TAG, "Battery=%.0f%% AC_in=%.0fW AC_out=%.0fW DC_in=%.0fW DC_out=%.0fW V_in=%.1fV",
                     //         data.battery_soc, data.ac_input_power, data.ac_output_power,
                     //         data.dc_input_power, data.dc_output_power, data.ac_input_voltage);
+
+                    if (last_log_time == 0 || (esp_timer_get_time() - last_log_time) > log_interval_us) {
+                        if (data_logger_append(&data)) {
+                            last_log_time = esp_timer_get_time();
+                        } else {
+                            ESP_LOGW(TAG, "data_logger_append() failed this cycle");
+                        }
+                    }
                 } else {
                     ESP_LOGW(TAG, "get_all_data() failed this cycle, will reconnect");
                     if(sendDebugTgMsg == true)
@@ -284,6 +341,33 @@ extern "C" void app_main(void)
                             telegram_send_messagef("✅ DC output switched %s", new_state ? "ON" : "OFF");
                         } else {
                             telegram_send_message("❌ Failed to switch DC output - see device log");
+                        }
+                    }
+
+                    if (strcasecmp(msg, "/log") == 0) {
+                        ESP_LOGW(TAG, "log called");
+                        data_logger_append(&data);
+                    }
+
+                    // "/chart" alone, or "/chart <hours>" (e.g. "/chart 6")
+                    // for a wider/narrower window than the 1-hour default.
+                    // strncasecmp only checks the first 6 characters, unlike
+                    // the exact-match strcasecmp() used for the fixed
+                    // commands above - this command needs to accept
+                    // whatever (if anything) comes after it, not match it.
+                    if (strncasecmp(msg, "/chart", 6) == 0) {
+                        ESP_LOGW(TAG, "chart called: %s", msg);
+                        float hours = 1.0f;
+                        const char *arg = msg + 6;
+                        while (*arg == ' ') arg++; // skip the space between "/chart" and the argument, if any
+                        if (*arg != '\0') {
+                            float parsed = strtof(arg, nullptr);
+                            if (parsed > 0.0f) {
+                                hours = parsed;
+                            }
+                        }
+                        if (!chart_send_recent(hours)) {
+                            telegram_send_message("❌ Failed to build/send chart - no logged history in that window, or a send error (see device log)");
                         }
                     }
                 }
